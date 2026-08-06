@@ -1,0 +1,1106 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+
+  <meta
+    name="viewport"
+    content="width=device-width, initial-scale=1.0"
+  >
+
+  <title>Pose Hybrid Output</title>
+
+  <script
+    src="https://cdn.jsdelivr.net/npm/@mediapipe/pose/pose.js">
+  </script>
+
+  <style>
+    html,
+    body {
+      width: 100%;
+      height: 100%;
+      margin: 0;
+      overflow: hidden;
+      font-family: sans-serif;
+      background: black;
+    }
+
+    video,
+    canvas {
+      position: absolute;
+      top: 0;
+      left: 0;
+    }
+
+    video {
+      z-index: 1;
+    }
+
+    canvas {
+      z-index: 2;
+      pointer-events: none;
+    }
+
+    #controls {
+      position: absolute;
+      top: 10px;
+      left: 10px;
+      z-index: 10;
+
+      max-width: 300px;
+      padding: 10px;
+
+      color: black;
+      background: rgba(255, 255, 255, 0.8);
+
+      border-radius: 6px;
+
+      font-size: 12px;
+      line-height: 1.5;
+    }
+
+    #cameraSelect {
+      max-width: 220px;
+    }
+
+    #fps {
+      font-weight: bold;
+    }
+
+    #cameraStatus {
+      display: block;
+      max-width: 270px;
+      margin-top: 5px;
+
+      font-size: 11px;
+      overflow-wrap: anywhere;
+    }
+  </style>
+</head>
+
+<body>
+
+  <div id="controls">
+    <label>
+      Camera:
+      <select id="cameraSelect">
+        <option>Loading cameras...</option>
+      </select>
+    </label>
+
+    <br>
+
+    <label>
+      <input
+        type="checkbox"
+        id="showVideo"
+      >
+      Show Video
+    </label>
+
+    <br>
+
+    <label>
+      <input
+        type="checkbox"
+        id="showOverlay"
+        checked
+      >
+      Show Overlay
+    </label>
+
+    <br>
+
+    <label>
+      <input
+        type="checkbox"
+        id="sendOutput"
+        checked
+      >
+      Send Output
+    </label>
+
+    <br>
+
+    <label>
+      <input
+        type="checkbox"
+        id="flipHoriz"
+      >
+      Flip Horizontally
+    </label>
+
+    <br>
+
+    <label>
+      <input
+        type="checkbox"
+        id="flatList"
+      >
+      Flat List (vs XYZ lists)
+    </label>
+
+    <br>
+
+    <span id="fps">FPS: --</span>
+    <span id="cameraStatus">Camera: initialising...</span>
+  </div>
+
+  <video
+    id="inputVideo"
+    autoplay
+    muted
+    playsinline>
+  </video>
+
+  <canvas id="videoCanvas"></canvas>
+
+  <script>
+    /*
+      ================================================================
+      DOM ELEMENTS
+      ================================================================
+    */
+
+    const videoElement =
+      document.getElementById("inputVideo");
+
+    const canvasElement =
+      document.getElementById("videoCanvas");
+
+    const canvasCtx =
+      canvasElement.getContext("2d");
+
+    const cameraSelect =
+      document.getElementById("cameraSelect");
+
+    const fpsDisplay =
+      document.getElementById("fps");
+
+    const cameraStatus =
+      document.getElementById("cameraStatus");
+
+    const check = (id) =>
+      document.getElementById(id).checked;
+
+
+    /*
+      ================================================================
+      MAX / WEBSOCKET OUTPUT
+      ================================================================
+    */
+
+    let ws = null;
+
+    if (!window.max) {
+      try {
+        ws = new WebSocket("ws://localhost:8086");
+      } catch (error) {
+        console.warn(
+          "Could not create WebSocket connection:",
+          error
+        );
+      }
+    }
+
+    function sendToMax(address, ...args) {
+      if (!check("sendOutput")) {
+        return;
+      }
+
+      if (
+        window.max &&
+        typeof window.max.outlet === "function"
+      ) {
+        window.max.outlet(address, ...args);
+        return;
+      }
+
+      if (
+        ws &&
+        ws.readyState === WebSocket.OPEN
+      ) {
+        ws.send(
+          JSON.stringify({
+            address,
+            args
+          })
+        );
+      }
+    }
+
+
+    /*
+      ================================================================
+      MEDIAPIPE POSE
+      ================================================================
+    */
+
+    const pose = new Pose({
+      locateFile: (file) =>
+        `https://cdn.jsdelivr.net/npm/@mediapipe/pose/${file}`
+    });
+
+    pose.setOptions({
+      modelComplexity: 1,
+      smoothLandmarks: true,
+      enableSegmentation: false,
+      minDetectionConfidence: 0.5,
+      minTrackingConfidence: 0.5
+    });
+
+    pose.onResults(onResults);
+
+
+    /*
+      ================================================================
+      CAMERA STATE
+      ================================================================
+    */
+
+    let activeStream = null;
+
+    /*
+      Incremented whenever a camera is started.
+
+      Each frame loop remembers the generation that created it. When the
+      generation changes, the old loop stops itself.
+    */
+    let cameraGeneration = 0;
+
+    /*
+      Prevents overlapping pose.send() calls.
+    */
+    let poseIsProcessing = false;
+
+    /*
+      Records the currently selected camera ID.
+    */
+    let activeDeviceId = null;
+
+
+    /*
+      ================================================================
+      CAMERA INITIALISATION
+      ================================================================
+    */
+
+    async function initialiseCameras() {
+      if (
+        !navigator.mediaDevices ||
+        !navigator.mediaDevices.getUserMedia
+      ) {
+        cameraStatus.textContent =
+          "Camera API is not available.";
+
+        console.error(
+          "navigator.mediaDevices.getUserMedia is unavailable."
+        );
+
+        return;
+      }
+
+      cameraSelect.disabled = true;
+
+      try {
+        /*
+          Request camera permission once.
+
+          Browsers frequently hide camera names until permission has
+          been granted.
+        */
+        const permissionStream =
+          await navigator.mediaDevices.getUserMedia({
+            video: true,
+            audio: false
+          });
+
+        permissionStream
+          .getTracks()
+          .forEach((track) => track.stop());
+
+        await refreshCameraList({
+          startFirstCamera: true
+        });
+
+        if (
+          typeof navigator.mediaDevices.addEventListener ===
+          "function"
+        ) {
+          navigator.mediaDevices.addEventListener(
+            "devicechange",
+            handleDeviceChange
+          );
+        }
+      } catch (error) {
+        handleCameraError(
+          error,
+          "Could not initialise cameras"
+        );
+      } finally {
+        cameraSelect.disabled = false;
+      }
+    }
+
+
+    /*
+      ================================================================
+      CAMERA MENU
+      ================================================================
+    */
+
+    async function getVideoInputs() {
+      const devices =
+        await navigator.mediaDevices.enumerateDevices();
+
+      return devices.filter(
+        (device) => device.kind === "videoinput"
+      );
+    }
+
+    async function refreshCameraList({
+      startFirstCamera = false
+    } = {}) {
+      const previousSelection =
+        cameraSelect.value || activeDeviceId;
+
+      const videoInputs =
+        await getVideoInputs();
+
+      cameraSelect.innerHTML = "";
+
+      if (videoInputs.length === 0) {
+        const option =
+          document.createElement("option");
+
+        option.textContent =
+          "No cameras found";
+
+        option.value = "";
+
+        cameraSelect.appendChild(option);
+        cameraSelect.disabled = true;
+
+        cameraStatus.textContent =
+          "Camera: no video inputs found";
+
+        return;
+      }
+
+      videoInputs.forEach((device, index) => {
+        const option =
+          document.createElement("option");
+
+        option.value = device.deviceId;
+
+        option.textContent =
+          device.label ||
+          `Camera ${index + 1}`;
+
+        cameraSelect.appendChild(option);
+      });
+
+      cameraSelect.disabled = false;
+
+      const previousStillExists =
+        videoInputs.some(
+          (device) =>
+            device.deviceId === previousSelection
+        );
+
+      if (previousStillExists) {
+        cameraSelect.value =
+          previousSelection;
+      } else {
+        cameraSelect.value =
+          videoInputs[0].deviceId;
+      }
+
+      if (startFirstCamera) {
+        await startCamera(
+          cameraSelect.value
+        );
+      }
+    }
+
+    async function handleDeviceChange() {
+      try {
+        const oldActiveDeviceId =
+          activeDeviceId;
+
+        await refreshCameraList();
+
+        const videoInputs =
+          await getVideoInputs();
+
+        const activeCameraStillExists =
+          videoInputs.some(
+            (device) =>
+              device.deviceId === oldActiveDeviceId
+          );
+
+        if (!activeCameraStillExists) {
+          await startCamera(
+            cameraSelect.value
+          );
+        }
+      } catch (error) {
+        console.error(
+          "Could not refresh camera list:",
+          error
+        );
+      }
+    }
+
+
+    /*
+      ================================================================
+      CAMERA SELECTION
+      ================================================================
+    */
+
+    cameraSelect.addEventListener(
+      "change",
+      async () => {
+        if (!cameraSelect.value) {
+          return;
+        }
+
+        await startCamera(
+          cameraSelect.value
+        );
+      }
+    );
+
+    async function startCamera(deviceId) {
+      if (!deviceId) {
+        return;
+      }
+
+      /*
+        Invalidates the previous frame-processing loop.
+      */
+      const thisGeneration =
+        ++cameraGeneration;
+
+      cameraSelect.disabled = true;
+
+      cameraStatus.textContent =
+        "Camera: switching...";
+
+      /*
+        Completely stop and release the previous camera.
+      */
+      stopActiveCamera();
+
+      videoElement.pause();
+      videoElement.srcObject = null;
+
+      try {
+        /*
+          This is the important part.
+
+          deviceId must be supplied to getUserMedia() as a browser
+          constraint. MediaPipe's Camera helper does not accept exact
+          device IDs.
+        */
+        const stream =
+          await navigator.mediaDevices.getUserMedia({
+            audio: false,
+
+            video: {
+              deviceId: {
+                exact: deviceId
+              },
+
+              width: {
+                ideal: 640
+              },
+
+              height: {
+                ideal: 480
+              }
+            }
+          });
+
+        /*
+          A second camera selection may have happened while the
+          getUserMedia request was pending.
+        */
+        if (
+          thisGeneration !== cameraGeneration
+        ) {
+          stream
+            .getTracks()
+            .forEach((track) => track.stop());
+
+          return;
+        }
+
+        activeStream = stream;
+        activeDeviceId = deviceId;
+
+        videoElement.srcObject =
+          activeStream;
+
+        await waitForVideoMetadata();
+
+        await videoElement.play();
+
+        resizeDisplay();
+
+        const videoTrack =
+          activeStream.getVideoTracks()[0];
+
+        const settings =
+          videoTrack.getSettings();
+
+        const label =
+          videoTrack.label ||
+          cameraSelect.options[
+            cameraSelect.selectedIndex
+          ]?.text ||
+          "Unknown camera";
+
+        cameraStatus.textContent =
+          `Camera: ${label}`;
+
+        console.log(
+          "Active camera:",
+          {
+            label,
+            requestedDeviceId: deviceId,
+            actualDeviceId:
+              settings.deviceId,
+            width:
+              settings.width,
+            height:
+              settings.height,
+            frameRate:
+              settings.frameRate
+          }
+        );
+
+        processCameraFrames(
+          thisGeneration
+        );
+      } catch (error) {
+        handleCameraError(
+          error,
+          "Could not start selected camera"
+        );
+      } finally {
+        cameraSelect.disabled = false;
+      }
+    }
+
+    function stopActiveCamera() {
+      if (!activeStream) {
+        return;
+      }
+
+      activeStream
+        .getTracks()
+        .forEach((track) => {
+          track.stop();
+        });
+
+      activeStream = null;
+      activeDeviceId = null;
+    }
+
+    function waitForVideoMetadata() {
+      if (
+        videoElement.readyState >=
+        HTMLMediaElement.HAVE_METADATA
+      ) {
+        return Promise.resolve();
+      }
+
+      return new Promise(
+        (resolve, reject) => {
+          const timeout =
+            setTimeout(() => {
+              cleanup();
+
+              reject(
+                new Error(
+                  "Timed out waiting for video metadata."
+                )
+              );
+            }, 5000);
+
+          function cleanup() {
+            clearTimeout(timeout);
+
+            videoElement.removeEventListener(
+              "loadedmetadata",
+              handleLoadedMetadata
+            );
+
+            videoElement.removeEventListener(
+              "error",
+              handleVideoError
+            );
+          }
+
+          function handleLoadedMetadata() {
+            cleanup();
+            resolve();
+          }
+
+          function handleVideoError(event) {
+            cleanup();
+
+            reject(
+              new Error(
+                `Video element error: ${event.type}`
+              )
+            );
+          }
+
+          videoElement.addEventListener(
+            "loadedmetadata",
+            handleLoadedMetadata
+          );
+
+          videoElement.addEventListener(
+            "error",
+            handleVideoError
+          );
+        }
+      );
+    }
+
+
+    /*
+      ================================================================
+      FRAME PROCESSING
+      ================================================================
+    */
+
+    async function processCameraFrames(
+      generation
+    ) {
+      /*
+        Stop the loop if another camera has replaced this one.
+      */
+      if (
+        generation !== cameraGeneration
+      ) {
+        return;
+      }
+
+      if (
+        !activeStream ||
+        !activeStream.active
+      ) {
+        return;
+      }
+
+      const videoTrack =
+        activeStream.getVideoTracks()[0];
+
+      if (
+        !videoTrack ||
+        videoTrack.readyState !== "live"
+      ) {
+        return;
+      }
+
+      if (
+        videoElement.readyState >=
+          HTMLMediaElement.HAVE_CURRENT_DATA &&
+        !poseIsProcessing
+      ) {
+        poseIsProcessing = true;
+
+        try {
+          await pose.send({
+            image: videoElement
+          });
+        } catch (error) {
+          console.error(
+            "Pose processing error:",
+            error
+          );
+        } finally {
+          poseIsProcessing = false;
+        }
+      }
+
+      requestAnimationFrame(() => {
+        processCameraFrames(
+          generation
+        );
+      });
+    }
+
+
+    /*
+      ================================================================
+      POSE RESULTS
+      ================================================================
+    */
+
+    let lastTime =
+      performance.now();
+
+    let frameCount = 0;
+
+    function onResults(results) {
+      resizeDisplay();
+
+      canvasCtx.clearRect(
+        0,
+        0,
+        canvasElement.width,
+        canvasElement.height
+      );
+
+      canvasCtx.save();
+
+      if (check("flipHoriz")) {
+        canvasCtx.translate(
+          canvasElement.width,
+          0
+        );
+
+        canvasCtx.scale(
+          -1,
+          1
+        );
+      }
+
+      if (
+        check("showOverlay") &&
+        results.poseLandmarks
+      ) {
+        drawOverlay(
+          results.poseLandmarks
+        );
+      }
+
+      canvasCtx.restore();
+
+      if (
+        check("sendOutput") &&
+        results.poseLandmarks
+      ) {
+        const landmarks =
+          results.poseLandmarks;
+
+        if (check("flatList")) {
+          sendToMax(
+            "/pose/flat",
+            ...landmarks.flatMap(
+              (point) => [
+                point.x,
+                point.y,
+                point.z
+              ]
+            )
+          );
+        } else {
+          const xs =
+            landmarks.map(
+              (point) => point.x
+            );
+
+          const ys =
+            landmarks.map(
+              (point) => point.y
+            );
+
+          const zs =
+            landmarks.map(
+              (point) => point.z
+            );
+
+          sendToMax(
+            "/pose/x",
+            ...xs
+          );
+
+          sendToMax(
+            "/pose/y",
+            ...ys
+          );
+
+          sendToMax(
+            "/pose/z",
+            ...zs
+          );
+        }
+      }
+
+      updateFPS();
+      updateVideoVisibility();
+    }
+
+
+    /*
+      ================================================================
+      FPS
+      ================================================================
+    */
+
+    function updateFPS() {
+      frameCount++;
+
+      const now =
+        performance.now();
+
+      const elapsed =
+        now - lastTime;
+
+      if (elapsed < 1000) {
+        return;
+      }
+
+      const fps =
+        (
+          frameCount /
+          (elapsed / 1000)
+        ).toFixed(1);
+
+      fpsDisplay.textContent =
+        `FPS: ${fps}`;
+
+      sendToMax(
+        "/pose/fps",
+        Number(fps)
+      );
+
+      lastTime = now;
+      frameCount = 0;
+    }
+
+
+    /*
+      ================================================================
+      DISPLAY
+      ================================================================
+    */
+
+    function resizeDisplay() {
+      const width =
+        videoElement.videoWidth || 640;
+
+      const height =
+        videoElement.videoHeight || 480;
+
+      if (
+        canvasElement.width !== width ||
+        canvasElement.height !== height
+      ) {
+        canvasElement.width = width;
+        canvasElement.height = height;
+      }
+
+      videoElement.width = width;
+      videoElement.height = height;
+    }
+
+    function updateVideoVisibility() {
+      videoElement.style.visibility =
+        check("showVideo")
+          ? "visible"
+          : "hidden";
+    }
+
+    document
+      .getElementById("showVideo")
+      .addEventListener(
+        "change",
+        updateVideoVisibility
+      );
+
+    updateVideoVisibility();
+
+
+    /*
+      ================================================================
+      POSE DRAWING
+      ================================================================
+    */
+
+    const POSE_CONNECTIONS = [
+      [11, 13],
+      [13, 15],
+
+      [12, 14],
+      [14, 16],
+
+      [11, 12],
+
+      [23, 24],
+
+      [11, 23],
+      [12, 24],
+
+      [23, 25],
+      [25, 27],
+
+      [24, 26],
+      [26, 28],
+
+      [27, 31],
+      [28, 32]
+    ];
+
+    function drawOverlay(landmarks) {
+      canvasCtx.strokeStyle =
+        "green";
+
+      canvasCtx.lineWidth = 1;
+
+      canvasCtx.fillStyle =
+        "green";
+
+      for (
+        const [firstIndex, secondIndex]
+        of POSE_CONNECTIONS
+      ) {
+        const firstPoint =
+          landmarks[firstIndex];
+
+        const secondPoint =
+          landmarks[secondIndex];
+
+        if (
+          !firstPoint ||
+          !secondPoint
+        ) {
+          continue;
+        }
+
+        canvasCtx.beginPath();
+
+        canvasCtx.moveTo(
+          firstPoint.x *
+            canvasElement.width,
+
+          firstPoint.y *
+            canvasElement.height
+        );
+
+        canvasCtx.lineTo(
+          secondPoint.x *
+            canvasElement.width,
+
+          secondPoint.y *
+            canvasElement.height
+        );
+
+        canvasCtx.stroke();
+      }
+
+      for (const point of landmarks) {
+        const x =
+          point.x *
+          canvasElement.width;
+
+        const y =
+          point.y *
+          canvasElement.height;
+
+        canvasCtx.beginPath();
+
+        canvasCtx.arc(
+          x,
+          y,
+          3,
+          0,
+          Math.PI * 2
+        );
+
+        canvasCtx.fill();
+      }
+    }
+
+
+    /*
+      ================================================================
+      ERROR HANDLING
+      ================================================================
+    */
+
+    function handleCameraError(
+      error,
+      context
+    ) {
+      console.error(
+        `${context}:`,
+        error
+      );
+
+      let message =
+        error.message ||
+        error.name ||
+        "Unknown camera error";
+
+      if (
+        error.name ===
+        "NotAllowedError"
+      ) {
+        message =
+          "Camera permission was denied.";
+      } else if (
+        error.name ===
+        "NotFoundError"
+      ) {
+        message =
+          "The selected camera was not found.";
+      } else if (
+        error.name ===
+        "NotReadableError"
+      ) {
+        message =
+          "The camera may already be in use by another application.";
+      } else if (
+        error.name ===
+        "OverconstrainedError"
+      ) {
+        message =
+          "The selected camera does not support the requested constraints.";
+      }
+
+      cameraStatus.textContent =
+        `Camera error: ${message}`;
+
+      fpsDisplay.textContent =
+        "FPS: --";
+    }
+
+
+    /*
+      ================================================================
+      CLEANUP
+      ================================================================
+    */
+
+    window.addEventListener(
+      "beforeunload",
+      () => {
+        cameraGeneration++;
+        stopActiveCamera();
+
+        if (ws) {
+          ws.close();
+        }
+      }
+    );
+
+
+    /*
+      ================================================================
+      START
+      ================================================================
+    */
+
+    initialiseCameras();
+  </script>
+
+</body>
+</html>
