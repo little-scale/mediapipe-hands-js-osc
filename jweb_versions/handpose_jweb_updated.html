@@ -1,0 +1,1586 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>HandPose Hybrid Output (Wireframe + Depth)</title>
+
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js"></script>
+
+  <style>
+    body {
+      font-family: sans-serif;
+      margin: 0;
+      background: black;
+      overflow: hidden;
+    }
+
+    video,
+    canvas {
+      position: absolute;
+      top: 0;
+      left: 0;
+    }
+
+    video {
+      z-index: 1;
+    }
+
+    canvas {
+      z-index: 2;
+      pointer-events: none;
+    }
+
+    #controls {
+      position: absolute;
+      top: 10px;
+      left: 10px;
+      z-index: 10;
+      background: rgba(255, 255, 255, 0.8);
+      padding: 10px;
+      font-size: 12px;
+      line-height: 1.4;
+      max-width: 300px;
+      border-radius: 6px;
+    }
+
+    #cameraSelect {
+      max-width: 220px;
+    }
+
+    #fps {
+      font-weight: bold;
+    }
+
+    #cameraStatus {
+      display: block;
+      margin-top: 4px;
+      max-width: 280px;
+      font-size: 11px;
+      overflow-wrap: anywhere;
+    }
+  </style>
+</head>
+
+<body>
+
+<div id="controls">
+
+  <label>
+    Camera:
+    <select id="cameraSelect">
+      <option>Loading cameras...</option>
+    </select>
+  </label>
+
+  <br>
+
+  <label>
+    <input type="checkbox" id="showVideo">
+    Show Video
+  </label>
+
+  <br>
+
+  <label>
+    <input type="checkbox" id="showOverlay" checked>
+    Show Overlay
+  </label>
+
+  <br>
+
+  <label>
+    <input type="checkbox" id="sendOutput" checked>
+    Send Output
+  </label>
+
+  <br>
+
+  <label>
+    <input type="checkbox" id="multiHands">
+    Output Two Hands (max 2)
+  </label>
+
+  <br>
+
+  <label>
+    <input type="checkbox" id="flatList">
+    Flat List (vs XYZ lists)
+  </label>
+
+  <br>
+
+  <label>
+    <input type="checkbox" id="flipHoriz">
+    Flip Horizontally
+  </label>
+
+  <br>
+
+  <span id="fps">FPS: --</span>
+
+  <span id="cameraStatus">
+    Camera: initialising...
+  </span>
+
+</div>
+
+
+<video
+  id="inputVideo"
+  autoplay
+  muted
+  playsinline>
+</video>
+
+<canvas id="videoCanvas"></canvas>
+
+
+<script>
+
+/*
+================================================================
+ELEMENTS
+================================================================
+*/
+
+const videoElement =
+  document.getElementById("inputVideo");
+
+const canvasElement =
+  document.getElementById("videoCanvas");
+
+const canvasCtx =
+  canvasElement.getContext("2d");
+
+const cameraSelect =
+  document.getElementById("cameraSelect");
+
+const fpsDisplay =
+  document.getElementById("fps");
+
+const cameraStatus =
+  document.getElementById("cameraStatus");
+
+const check = (id) =>
+  document.getElementById(id).checked;
+
+
+/*
+================================================================
+MAX / WEBSOCKET OUTPUT
+================================================================
+*/
+
+let ws = null;
+
+if (!window.max) {
+  try {
+    ws = new WebSocket(
+      "ws://localhost:8085"
+    );
+  } catch (error) {
+    console.warn(
+      "Could not create WebSocket:",
+      error
+    );
+  }
+}
+
+
+function sendToMax(address, ...args) {
+
+  if (!check("sendOutput")) {
+    return;
+  }
+
+  if (
+    window.max &&
+    typeof window.max.outlet === "function"
+  ) {
+    window.max.outlet(
+      address,
+      ...args
+    );
+
+    return;
+  }
+
+  if (
+    ws &&
+    ws.readyState === WebSocket.OPEN
+  ) {
+    ws.send(
+      JSON.stringify({
+        address,
+        args
+      })
+    );
+  }
+}
+
+
+/*
+================================================================
+MEDIAPIPE HANDS
+================================================================
+*/
+
+const hands = new Hands({
+
+  locateFile: (file) =>
+    `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`
+
+});
+
+
+hands.setOptions({
+
+  maxNumHands: 2,
+
+  modelComplexity: 1,
+
+  minDetectionConfidence: 0.5,
+
+  minTrackingConfidence: 0.5
+
+});
+
+
+hands.onResults(onResults);
+
+
+/*
+================================================================
+CAMERA STATE
+================================================================
+*/
+
+let activeStream = null;
+
+let activeDeviceId = null;
+
+/*
+  Each time a camera is selected this number changes.
+
+  Any old frame-processing loop sees that its generation is no
+  longer current and terminates.
+*/
+let cameraGeneration = 0;
+
+
+/*
+  MediaPipe should only process one frame at a time.
+*/
+let handsIsProcessing = false;
+
+
+/*
+================================================================
+CAMERA INITIALISATION
+================================================================
+*/
+
+async function initialiseCameras() {
+
+  if (
+    !navigator.mediaDevices ||
+    !navigator.mediaDevices.getUserMedia
+  ) {
+
+    cameraStatus.textContent =
+      "Camera API unavailable";
+
+    console.error(
+      "getUserMedia is unavailable"
+    );
+
+    return;
+  }
+
+
+  cameraSelect.disabled = true;
+
+
+  try {
+
+    /*
+      Request permission first.
+
+      This is important because Chromium will often hide camera
+      names until camera permission has been granted.
+    */
+
+    const permissionStream =
+      await navigator.mediaDevices.getUserMedia({
+        video: true,
+        audio: false
+      });
+
+
+    permissionStream
+      .getTracks()
+      .forEach(
+        track => track.stop()
+      );
+
+
+    /*
+      Give the first camera a moment to be fully released.
+      This can help USB capture devices in particular.
+    */
+
+    await sleep(100);
+
+
+    await refreshCameraList();
+
+
+    if (
+      cameraSelect.options.length > 0 &&
+      cameraSelect.value
+    ) {
+
+      await startCamera(
+        cameraSelect.value
+      );
+
+    }
+
+
+    /*
+      Update menu if cameras are connected/disconnected.
+    */
+
+    if (
+      navigator.mediaDevices.addEventListener
+    ) {
+
+      navigator.mediaDevices.addEventListener(
+        "devicechange",
+        handleDeviceChange
+      );
+
+    }
+
+  }
+
+  catch (error) {
+
+    handleCameraError(
+      error,
+      "Could not initialise cameras"
+    );
+
+  }
+
+  finally {
+
+    cameraSelect.disabled = false;
+
+  }
+
+}
+
+
+/*
+================================================================
+CAMERA LIST
+================================================================
+*/
+
+async function getVideoInputs() {
+
+  const devices =
+    await navigator.mediaDevices.enumerateDevices();
+
+
+  return devices.filter(
+    device =>
+      device.kind === "videoinput"
+  );
+
+}
+
+
+async function refreshCameraList() {
+
+  const previousSelection =
+    activeDeviceId ||
+    cameraSelect.value;
+
+
+  const videoInputs =
+    await getVideoInputs();
+
+
+  cameraSelect.innerHTML = "";
+
+
+  if (!videoInputs.length) {
+
+    const option =
+      document.createElement("option");
+
+    option.textContent =
+      "No cameras found";
+
+    option.value = "";
+
+    cameraSelect.appendChild(
+      option
+    );
+
+    cameraStatus.textContent =
+      "Camera: none found";
+
+    return;
+  }
+
+
+  videoInputs.forEach(
+    (device, index) => {
+
+      const option =
+        document.createElement("option");
+
+
+      option.value =
+        device.deviceId;
+
+
+      option.textContent =
+        device.label ||
+        `Camera ${index + 1}`;
+
+
+      cameraSelect.appendChild(
+        option
+      );
+
+    }
+  );
+
+
+  /*
+    Preserve current selection if it still exists.
+  */
+
+  const previousExists =
+    videoInputs.some(
+      device =>
+        device.deviceId ===
+        previousSelection
+    );
+
+
+  if (previousExists) {
+
+    cameraSelect.value =
+      previousSelection;
+
+  }
+
+  else {
+
+    cameraSelect.value =
+      videoInputs[0].deviceId;
+
+  }
+
+}
+
+
+async function handleDeviceChange() {
+
+  try {
+
+    const oldDevice =
+      activeDeviceId;
+
+
+    await refreshCameraList();
+
+
+    const videoInputs =
+      await getVideoInputs();
+
+
+    const stillExists =
+      videoInputs.some(
+        device =>
+          device.deviceId ===
+          oldDevice
+      );
+
+
+    if (
+      !stillExists &&
+      cameraSelect.value
+    ) {
+
+      await startCamera(
+        cameraSelect.value
+      );
+
+    }
+
+  }
+
+  catch (error) {
+
+    console.error(
+      "Could not refresh cameras:",
+      error
+    );
+
+  }
+
+}
+
+
+/*
+================================================================
+CAMERA SELECT MENU
+================================================================
+*/
+
+cameraSelect.addEventListener(
+  "change",
+
+  async () => {
+
+    const deviceId =
+      cameraSelect.value;
+
+
+    if (!deviceId) {
+      return;
+    }
+
+
+    console.log(
+      "Requested camera:",
+      deviceId
+    );
+
+
+    await startCamera(
+      deviceId
+    );
+
+  }
+);
+
+
+/*
+================================================================
+START SELECTED CAMERA
+================================================================
+*/
+
+async function startCamera(deviceId) {
+
+  if (!deviceId) {
+    return;
+  }
+
+
+  /*
+    Invalidate any existing frame loop.
+  */
+
+  const generation =
+    ++cameraGeneration;
+
+
+  cameraSelect.disabled = true;
+
+
+  cameraStatus.textContent =
+    "Camera: switching...";
+
+
+  /*
+    Fully release previous camera.
+  */
+
+  stopActiveCamera();
+
+
+  videoElement.pause();
+
+  videoElement.srcObject = null;
+
+
+  /*
+    Some USB cameras and capture interfaces need a short moment
+    between closing one stream and opening another.
+  */
+
+  await sleep(100);
+
+
+  try {
+
+    /*
+      IMPORTANT:
+
+      Device selection happens HERE, using browser constraints.
+
+      MediaPipe's Camera helper is deliberately not used.
+    */
+
+    const stream =
+      await navigator.mediaDevices.getUserMedia({
+
+        audio: false,
+
+        video: {
+
+          deviceId: {
+            exact: deviceId
+          },
+
+          width: {
+            ideal: 640
+          },
+
+          height: {
+            ideal: 480
+          }
+
+        }
+
+      });
+
+
+    /*
+      User may have selected another camera while getUserMedia()
+      was resolving.
+    */
+
+    if (
+      generation !==
+      cameraGeneration
+    ) {
+
+      stream
+        .getTracks()
+        .forEach(
+          track => track.stop()
+        );
+
+      return;
+    }
+
+
+    activeStream =
+      stream;
+
+
+    activeDeviceId =
+      deviceId;
+
+
+    videoElement.srcObject =
+      stream;
+
+
+    await waitForVideoMetadata();
+
+
+    await videoElement.play();
+
+
+    resizeDisplay();
+
+
+    /*
+      Inspect what Chromium ACTUALLY opened.
+    */
+
+    const track =
+      stream.getVideoTracks()[0];
+
+
+    const settings =
+      track.getSettings();
+
+
+    const capabilities =
+      typeof track.getCapabilities === "function"
+        ? track.getCapabilities()
+        : {};
+
+
+    const label =
+      track.label ||
+      cameraSelect.options[
+        cameraSelect.selectedIndex
+      ]?.text ||
+      "Unknown camera";
+
+
+    cameraStatus.textContent =
+      `Camera: ${label}`;
+
+
+    console.log(
+      "CAMERA OPENED",
+      {
+        label: label,
+
+        requestedDeviceId:
+          deviceId,
+
+        actualDeviceId:
+          settings.deviceId,
+
+        width:
+          settings.width,
+
+        height:
+          settings.height,
+
+        frameRate:
+          settings.frameRate,
+
+        settings:
+          settings,
+
+        capabilities:
+          capabilities
+      }
+    );
+
+
+    /*
+      Start MediaPipe frame loop.
+    */
+
+    processCameraFrames(
+      generation
+    );
+
+  }
+
+  catch (error) {
+
+    handleCameraError(
+      error,
+      "Could not start selected camera"
+    );
+
+  }
+
+  finally {
+
+    cameraSelect.disabled =
+      false;
+
+  }
+
+}
+
+
+/*
+================================================================
+STOP CAMERA
+================================================================
+*/
+
+function stopActiveCamera() {
+
+  if (!activeStream) {
+    return;
+  }
+
+
+  activeStream
+    .getTracks()
+    .forEach(
+      track => {
+
+        console.log(
+          "Stopping track:",
+          track.label
+        );
+
+        track.stop();
+
+      }
+    );
+
+
+  activeStream =
+    null;
+
+
+  activeDeviceId =
+    null;
+
+}
+
+
+/*
+================================================================
+VIDEO METADATA
+================================================================
+*/
+
+function waitForVideoMetadata() {
+
+  if (
+    videoElement.readyState >=
+    HTMLMediaElement.HAVE_METADATA
+  ) {
+
+    return Promise.resolve();
+
+  }
+
+
+  return new Promise(
+    (resolve, reject) => {
+
+      const timeout =
+        setTimeout(
+          () => {
+
+            cleanup();
+
+            reject(
+              new Error(
+                "Timed out waiting for video metadata"
+              )
+            );
+
+          },
+          5000
+        );
+
+
+      function cleanup() {
+
+        clearTimeout(
+          timeout
+        );
+
+
+        videoElement.removeEventListener(
+          "loadedmetadata",
+          loaded
+        );
+
+
+        videoElement.removeEventListener(
+          "error",
+          failed
+        );
+
+      }
+
+
+      function loaded() {
+
+        cleanup();
+
+        resolve();
+
+      }
+
+
+      function failed() {
+
+        cleanup();
+
+        reject(
+          new Error(
+            "Video element failed"
+          )
+        );
+
+      }
+
+
+      videoElement.addEventListener(
+        "loadedmetadata",
+        loaded
+      );
+
+
+      videoElement.addEventListener(
+        "error",
+        failed
+      );
+
+    }
+  );
+
+}
+
+
+/*
+================================================================
+FRAME PROCESSING
+================================================================
+*/
+
+async function processCameraFrames(
+  generation
+) {
+
+  /*
+    Old camera loop?
+    Stop immediately.
+  */
+
+  if (
+    generation !==
+    cameraGeneration
+  ) {
+    return;
+  }
+
+
+  if (
+    !activeStream ||
+    !activeStream.active
+  ) {
+    return;
+  }
+
+
+  const track =
+    activeStream.getVideoTracks()[0];
+
+
+  if (
+    !track ||
+    track.readyState !== "live"
+  ) {
+    return;
+  }
+
+
+  /*
+    Only submit a frame when video data exists and MediaPipe
+    isn't still processing the previous frame.
+  */
+
+  if (
+    videoElement.readyState >=
+      HTMLMediaElement.HAVE_CURRENT_DATA &&
+    !handsIsProcessing
+  ) {
+
+    handsIsProcessing =
+      true;
+
+
+    try {
+
+      await hands.send({
+        image: videoElement
+      });
+
+    }
+
+    catch (error) {
+
+      console.error(
+        "Hand processing error:",
+        error
+      );
+
+    }
+
+    finally {
+
+      handsIsProcessing =
+        false;
+
+    }
+
+  }
+
+
+  requestAnimationFrame(
+    () => {
+
+      processCameraFrames(
+        generation
+      );
+
+    }
+  );
+
+}
+
+
+/*
+================================================================
+MEDIAPIPE RESULTS
+================================================================
+*/
+
+let lastTime =
+  performance.now();
+
+let frameCount = 0;
+
+
+function onResults(results) {
+
+  resizeDisplay();
+
+
+  canvasCtx.clearRect(
+    0,
+    0,
+    canvasElement.width,
+    canvasElement.height
+  );
+
+
+  canvasCtx.save();
+
+
+  if (check("flipHoriz")) {
+
+    canvasCtx.translate(
+      canvasElement.width,
+      0
+    );
+
+    canvasCtx.scale(
+      -1,
+      1
+    );
+
+  }
+
+
+  /*
+    Draw hands.
+  */
+
+  if (
+    check("showOverlay") &&
+    results.multiHandLandmarks
+  ) {
+
+    results.multiHandLandmarks.forEach(
+      landmarks =>
+        drawOverlay(landmarks)
+    );
+
+  }
+
+
+  canvasCtx.restore();
+
+
+  /*
+    Output landmark data.
+  */
+
+  if (
+    check("sendOutput") &&
+    results.multiHandLandmarks
+  ) {
+
+    const handsOut =
+      check("multiHands")
+        ? results.multiHandLandmarks
+        : results.multiHandLandmarks.slice(
+            0,
+            1
+          );
+
+
+    handsOut.forEach(
+      (landmarks, index) => {
+
+        if (check("flatList")) {
+
+          sendToMax(
+            `/hand${index}/flat`,
+
+            ...landmarks.flatMap(
+              point => [
+                point.x,
+                point.y,
+                point.z
+              ]
+            )
+          );
+
+        }
+
+        else {
+
+          const xs =
+            landmarks.map(
+              point => point.x
+            );
+
+
+          const ys =
+            landmarks.map(
+              point => point.y
+            );
+
+
+          const zs =
+            landmarks.map(
+              point => point.z
+            );
+
+
+          sendToMax(
+            `/hand${index}/x`,
+            ...xs
+          );
+
+
+          sendToMax(
+            `/hand${index}/y`,
+            ...ys
+          );
+
+
+          sendToMax(
+            `/hand${index}/z`,
+            ...zs
+          );
+
+        }
+
+      }
+    );
+
+  }
+
+
+  updateFPS();
+
+  updateVideoVisibility();
+
+}
+
+
+/*
+================================================================
+FPS
+================================================================
+*/
+
+function updateFPS() {
+
+  frameCount++;
+
+
+  const now =
+    performance.now();
+
+
+  const elapsed =
+    now - lastTime;
+
+
+  if (elapsed < 1000) {
+    return;
+  }
+
+
+  const fps =
+    (
+      frameCount /
+      (elapsed / 1000)
+    ).toFixed(1);
+
+
+  fpsDisplay.textContent =
+    `FPS: ${fps}`;
+
+
+  sendToMax(
+    "/hands/fps",
+    Number(fps)
+  );
+
+
+  lastTime =
+    now;
+
+
+  frameCount =
+    0;
+
+}
+
+
+/*
+================================================================
+VIDEO DISPLAY
+================================================================
+*/
+
+function resizeDisplay() {
+
+  const width =
+    videoElement.videoWidth ||
+    640;
+
+
+  const height =
+    videoElement.videoHeight ||
+    480;
+
+
+  if (
+    canvasElement.width !== width ||
+    canvasElement.height !== height
+  ) {
+
+    canvasElement.width =
+      width;
+
+    canvasElement.height =
+      height;
+
+  }
+
+
+  videoElement.width =
+    width;
+
+  videoElement.height =
+    height;
+
+}
+
+
+function updateVideoVisibility() {
+
+  /*
+    Use visibility instead of display:none.
+
+    This keeps the video element active in Chromium/jweb even when
+    we don't want to visually display the camera feed.
+  */
+
+  videoElement.style.visibility =
+    check("showVideo")
+      ? "visible"
+      : "hidden";
+
+}
+
+
+document
+  .getElementById("showVideo")
+  .addEventListener(
+    "change",
+    updateVideoVisibility
+  );
+
+
+updateVideoVisibility();
+
+
+/*
+================================================================
+HAND CONNECTIONS
+================================================================
+*/
+
+const HAND_CONNECTIONS = [
+
+  [0, 1],
+  [1, 2],
+  [2, 3],
+  [3, 4],
+
+  [0, 5],
+  [5, 6],
+  [6, 7],
+  [7, 8],
+
+  [5, 9],
+  [9, 10],
+  [10, 11],
+  [11, 12],
+
+  [9, 13],
+  [13, 14],
+  [14, 15],
+  [15, 16],
+
+  [13, 17],
+  [17, 18],
+  [18, 19],
+  [19, 20],
+
+  [0, 17]
+
+];
+
+
+/*
+================================================================
+DRAW HAND
+================================================================
+*/
+
+function drawOverlay(
+  landmarks
+) {
+
+  canvasCtx.strokeStyle =
+    "green";
+
+
+  canvasCtx.lineWidth =
+    1;
+
+
+  canvasCtx.fillStyle =
+    "green";
+
+
+  /*
+    Wireframe
+  */
+
+  for (
+    const [i, j]
+    of HAND_CONNECTIONS
+  ) {
+
+    const p1 =
+      landmarks[i];
+
+
+    const p2 =
+      landmarks[j];
+
+
+    if (
+      !p1 ||
+      !p2
+    ) {
+      continue;
+    }
+
+
+    canvasCtx.beginPath();
+
+
+    canvasCtx.moveTo(
+
+      p1.x *
+        canvasElement.width,
+
+      p1.y *
+        canvasElement.height
+
+    );
+
+
+    canvasCtx.lineTo(
+
+      p2.x *
+        canvasElement.width,
+
+      p2.y *
+        canvasElement.height
+
+    );
+
+
+    canvasCtx.stroke();
+
+  }
+
+
+  /*
+    Landmarks with original depth-size behaviour.
+  */
+
+  for (
+    const point
+    of landmarks
+  ) {
+
+    const x =
+      point.x *
+      canvasElement.width;
+
+
+    const y =
+      point.y *
+      canvasElement.height;
+
+
+    const depthScale =
+      1 -
+      point.z * 10.0;
+
+
+    const radius =
+      Math.max(
+        1,
+        2 + depthScale
+      );
+
+
+    canvasCtx.beginPath();
+
+
+    canvasCtx.arc(
+      x,
+      y,
+      radius,
+      0,
+      Math.PI * 2
+    );
+
+
+    canvasCtx.fill();
+
+  }
+
+}
+
+
+/*
+================================================================
+ERROR HANDLING
+================================================================
+*/
+
+function handleCameraError(
+  error,
+  context
+) {
+
+  console.error(
+    `${context}:`,
+    error
+  );
+
+
+  let message =
+    error.message ||
+    error.name ||
+    "Unknown camera error";
+
+
+  if (
+    error.name ===
+    "NotAllowedError"
+  ) {
+
+    message =
+      "Camera permission denied.";
+
+  }
+
+  else if (
+    error.name ===
+    "NotFoundError"
+  ) {
+
+    message =
+      "Selected camera not found.";
+
+  }
+
+  else if (
+    error.name ===
+    "NotReadableError"
+  ) {
+
+    message =
+      "Camera unavailable or already in use.";
+
+  }
+
+  else if (
+    error.name ===
+    "OverconstrainedError"
+  ) {
+
+    message =
+      "Selected camera cannot satisfy requested constraints.";
+
+  }
+
+
+  cameraStatus.textContent =
+    `Camera error: ${message}`;
+
+
+  fpsDisplay.textContent =
+    "FPS: --";
+
+}
+
+
+/*
+================================================================
+UTILITY
+================================================================
+*/
+
+function sleep(ms) {
+
+  return new Promise(
+    resolve =>
+      setTimeout(
+        resolve,
+        ms
+      )
+  );
+
+}
+
+
+/*
+================================================================
+CLEANUP
+================================================================
+*/
+
+window.addEventListener(
+  "beforeunload",
+
+  () => {
+
+    cameraGeneration++;
+
+    stopActiveCamera();
+
+
+    if (ws) {
+      ws.close();
+    }
+
+  }
+);
+
+
+/*
+================================================================
+START
+================================================================
+*/
+
+initialiseCameras();
+
+</script>
+
+</body>
+</html>
